@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cmp::Ordering;
 use std::collections::binary_heap::PeekMut;
 use std::collections::{BinaryHeap, LinkedList};
 use std::future::Future;
@@ -108,6 +107,8 @@ pub struct MergeIteratorInner<I: HummockIterator, NE: NodeExtraOrderInfo> {
 
     /// Statistics.
     stats: Arc<StateStoreMetrics>,
+
+    last_table_key: Vec<u8>,
 }
 
 /// An order aware merge iterator.
@@ -128,6 +129,7 @@ impl<I: HummockIterator> OrderedMergeIteratorInner<I> {
             pending_iters: LinkedList::new(),
             heap: BinaryHeap::new(),
             stats,
+            last_table_key: vec![],
         }
     }
 }
@@ -160,6 +162,7 @@ impl<I: HummockIterator> UnorderedMergeIteratorInner<I> {
             pending_iters: LinkedList::new(),
             heap: BinaryHeap::new(),
             stats,
+            last_table_key: vec![],
         }
     }
 }
@@ -194,50 +197,52 @@ trait MergeIteratorNext {
 impl<I: HummockIterator> MergeIteratorNext for OrderedMergeIteratorInner<I> {
     fn poll_next_inner(&mut self) -> Poll<HummockResult<()>> {
         debug_assert!(self.pending_iters.is_empty());
-        let top_node = self.heap.pop().expect("no inner iter");
-        let mut popped_nodes = vec![];
+        let top_key = {
+            let top_key = self.heap.peek().expect("no inner iter").iter.key();
+            self.last_table_key.clear();
+            self.last_table_key.extend_from_slice(top_key);
+            self.last_table_key.as_slice()
+        };
 
-        // Take all nodes with the same current key as the top_node out of the heap.
-        while let Some(next_node) = self.heap.peek_mut() {
-            match VersionedComparator::compare_key(top_node.iter.key(), next_node.iter.key()) {
-                Ordering::Equal => {
-                    popped_nodes.push(PeekMut::pop(next_node));
+        loop {
+            let mut node = match self.heap.peek_mut() {
+                None => {
+                    break;
                 }
-                _ => break,
-            }
-        }
+                Some(node) => node,
+            };
+            // WARNING: within scope of BinaryHeap::PeekMut, we must carefully handle all places
+            // of return. Once the iterator enters an invalid state, we should
+            // remove it from heap before returning.
 
-        popped_nodes.push(top_node);
-
-        // WARNING: within scope of BinaryHeap::PeekMut, we must carefully handle all places of
-        // return. Once the iterator enters an invalid state, we should remove it from heap
-        // before returning.
-
-        // Put the popped nodes back to the heap if valid or unused_iters if invalid.
-        for mut node in popped_nodes {
-            match node.iter.poll_next() {
-                Poll::Ready(result) => match result {
-                    Ok(_) => {}
-                    Err(e) => {
-                        // If the iterator returns error, we should clear the heap, so that this
-                        // iterator becomes invalid.
-                        self.heap.clear();
-                        return Poll::Ready(Err(e));
+            if node.iter.key() == top_key {
+                match node.iter.poll_next() {
+                    Poll::Ready(result) => match result {
+                        Ok(_) => {}
+                        Err(e) => {
+                            // If the iterator returns error, we should clear the heap, so that this
+                            // iterator becomes invalid.
+                            drop(node);
+                            self.heap.clear();
+                            return Poll::Ready(Err(e));
+                        }
+                    },
+                    Poll::Pending => {
+                        self.pending_iters.push_back(PeekMut::pop(node));
+                        continue;
                     }
-                },
-                Poll::Pending => {
-                    self.pending_iters.push_back(node);
-                    continue;
                 }
-            }
 
-            if !node.iter.is_valid() {
-                self.unused_iters.push_back(node);
+                if !node.iter.is_valid() {
+                    self.unused_iters.push_back(PeekMut::pop(node));
+                } else {
+                    drop(node);
+                }
             } else {
-                self.heap.push(node);
+                drop(node);
+                break;
             }
         }
-
         if self.pending_iters.is_empty() {
             Poll::Ready(Ok(()))
         } else {
